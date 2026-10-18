@@ -321,7 +321,7 @@ dialog::backdrop{background:rgba(10,10,14,.5)}
 <div class="wrap">
   <header>
     <h1 class="disp">Big Picture <span class="gold">5-Day</span></h1>
-    <div class="sub">12-week program · kilograms · <span id="who"></span></div>
+    <div class="sub">12-week program · kilograms · <span id="who"></span><span id="syncdot"></span></div>
   </header>
   <div id="view"></div>
 </div>
@@ -412,7 +412,7 @@ function blankPlan(){
   return plan;
 }
 let state=null, storageOK=true;
-function defaults(){ return {v:1,name:"",restSec:120,library:JSON.parse(JSON.stringify(LIB_DEFAULT)),custom:{},plan:blankPlan(),logs:{},pos:{m:1,w:1,s:"A"},tab:"train",planOpen:"A",planMonth:{},trendEx:"",programmes:[],blocks:[],block:{id:uid(),name:"My block",progId:"",start:todayISO()},volSel:{m:1,w:1},pw:0,libOpen:{}}; }
+function defaults(){ return {v:1,name:"",restSec:120,library:JSON.parse(JSON.stringify(LIB_DEFAULT)),custom:{},plan:blankPlan(),logs:{},pos:{m:1,w:1,s:"A"},tab:"train",planOpen:"A",planMonth:{},trendEx:"",programmes:[],blocks:[],block:{id:uid(),name:"My block",progId:"",start:todayISO()},volSel:{m:1,w:1},pw:0,libOpen:{},sm:{cfg:0,logs:{}}}; }
 function load(){
   try{ const raw=localStorage.getItem(KEY); state = raw? Object.assign(defaults(),JSON.parse(raw)) : defaults(); }
   catch(e){ storageOK=false; state=defaults(); }
@@ -426,6 +426,8 @@ function migrate(){
   if(!state.volSel) state.volSel={m:1,w:1};
   if(!state.libOpen) state.libOpen={};
   if(state.pw==null) state.pw=0;
+  if(!state.sm) state.sm={cfg:0,logs:{}};
+  if(!state.sm.logs) state.sm.logs={};
   if(!state.block||!state.block.id){ const ds=Object.values(state.logs||{}).map(L=>L.date).filter(Boolean).sort(); state.block={id:uid(),name:"My block",progId:"",start:ds[0]||todayISO()}; }
   // the library is now keyed by the 16 muscle groups; older saves used movement patterns or 9 broad groups
   let rebuilt=false;
@@ -478,8 +480,12 @@ function migrate(){
   }
 }
 let saveT=null;
-function save(){ if(!storageOK) return;
-  clearTimeout(saveT); saveT=setTimeout(()=>{ try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){storageOK=false; toast("Couldn't save — storage unavailable");} },250);
+function save(){ if(!storageOK) return; clearTimeout(saveT); saveT=setTimeout(()=>flushSave(false),250); }
+function flushSave(quiet){
+  clearTimeout(saveT);
+  try{ stampChanges(); localStorage.setItem(KEY,JSON.stringify(state)); }
+  catch(e){ storageOK=false; toast("Couldn't save — storage unavailable"); return; }
+  if(!quiet) scheduleSync();
 }
 load();
 
@@ -652,7 +658,7 @@ function shortDate(iso){ return iso?new Date(iso+"T12:00:00").toLocaleDateString
 function progSummary(plan){ return SESSIONS.map(s=>s+" "+SLOTS.filter(sl=>plan[s]&&plan[s][1]&&plan[s][1][sl.id]&&plan[s][1][sl.id].ex).length).join(" · "); }
 function archiveBlock(){
   const st=blockStats(state.plan,state.logs); if(!st.sets) return false;
-  state.blocks.push({id:uid(),name:state.block.name||"Untitled block",progId:state.block.progId||"",start:state.block.start,end:todayISO(),plan:clone(state.plan),logs:clone(state.logs),summary:st});
+  state.blocks.push({id:state.block.id||uid(),name:state.block.name||"Untitled block",progId:state.block.progId||"",start:state.block.start,end:todayISO(),plan:clone(state.plan),logs:clone(state.logs),summary:st});
   return true;
 }
 function resetForNewBlock(){ state.logs={}; state.pos={m:1,w:1,s:"A"}; entry=null; rest=null; renderDock(); paintRest(); }
@@ -709,6 +715,190 @@ function render(){
   else v.innerHTML=dataHTML();
   wire();
   if(state.tab==="prog") drawTrend();
+}
+
+/* ================= CLOUD SYNC (Supabase over plain HTTPS) ================= */
+const SYNC_KEY="bpp5.sync", SYNC_T="/rest/v1/bp5_state";
+let sync=(()=>{
+  const d={url:"",key:"",session:null,deviceId:Math.random().toString(36).slice(2,8),baseRev:0,pushedHash:"",lastSync:0};
+  try{ Object.assign(d,JSON.parse(localStorage.getItem(SYNC_KEY)||"{}")); }catch(e){}
+  return Object.assign(d,{busy:false,again:false,status:d.session?"idle":"off",msg:"",lastTry:0,t:null});
+})();
+function persistSync(){ try{ const {url,key,session,deviceId,baseRev,pushedHash,lastSync}=sync; localStorage.setItem(SYNC_KEY,JSON.stringify({url,key,session,deviceId,baseRev,pushedHash,lastSync})); }catch(e){} }
+function hstr(x){ let h=5381; for(let i=0;i<x.length;i++) h=((h<<5)+h+x.charCodeAt(i))|0; return String(h); }
+function canon(o){ if(o===null||typeof o!=="object") return JSON.stringify(o); if(Array.isArray(o)) return "["+o.map(canon).join(",")+"]"; return "{"+Object.keys(o).sort().map(k=>JSON.stringify(k)+":"+canon(o[k])).join(",")+"}"; }
+function contentHash(d){ d=d||state; return hstr(canon({plan:d.plan,library:d.library,logs:d.logs,programmes:d.programmes,blocks:d.blocks,block:d.block,name:d.name})); }
+const HASHES={cfg:null,logs:{}};
+function cfgDoc(){ return {plan:state.plan,library:state.library,programmes:state.programmes,blocks:state.blocks,block:state.block,name:state.name}; }
+function baselineHashes(){ HASHES.cfg=hstr(JSON.stringify(cfgDoc())); HASHES.logs={}; for(const k in state.logs) HASHES.logs[k]=hstr(JSON.stringify(state.logs[k])); }
+/* remember when each part last changed on this device, so a merge can keep the newer side */
+function stampChanges(){
+  const now=Date.now(), sm=state.sm;
+  const ch=hstr(JSON.stringify(cfgDoc())); if(ch!==HASHES.cfg){ sm.cfg=now; HASHES.cfg=ch; }
+  for(const k in state.logs){ const lh=hstr(JSON.stringify(state.logs[k])); if(HASHES.logs[k]!==lh){ sm.logs[k]=now; HASHES.logs[k]=lh; } }
+  for(const k in sm.logs) if(!(k in state.logs)){ delete sm.logs[k]; delete HASHES.logs[k]; }
+}
+baselineHashes();
+function exportDoc(){ return JSON.parse(JSON.stringify({plan:state.plan,library:state.library,logs:state.logs,programmes:state.programmes,blocks:state.blocks,block:state.block,name:state.name,sm:state.sm})); }
+function applyDoc(d){
+  state.plan=d.plan; state.library=d.library; state.logs=d.logs||{}; state.programmes=d.programmes||[]; state.blocks=d.blocks||[]; state.block=d.block; state.name=d.name||""; state.sm=d.sm||{cfg:0,logs:{}};
+  migrate(); baselineHashes();
+  clearTimeout(saveT); try{ localStorage.setItem(KEY,JSON.stringify(state)); }catch(e){}
+  render();
+}
+function docEmpty(d){
+  const hasPlan=SESSIONS.some(s=>[1,2,3].some(m=>SLOTS.some(sl=>d.plan&&d.plan[s]&&d.plan[s][m]&&d.plan[s][m][sl.id]&&d.plan[s][m][sl.id].ex)));
+  return !hasPlan&&!blockStats(d.plan,d.logs||{}).sets&&!(d.programmes||[]).length&&!(d.blocks||[]).length;
+}
+function unionById(a,b,pick){ const m=new Map(); for(const x of (a||[])) m.set(x.id,x); for(const x of (b||[])){ const y=m.get(x.id); m.set(x.id,y&&pick?pick(y,x):(y||x)); } return [...m.values()]; }
+/* Merge two copies of the data. Logs: per session, newest edit wins. Plan/library/name: whichever side was edited last.
+   Saved programmes and archived blocks: union. A different active block on each side: the newer one stays active, the other is archived. */
+function mergeDocs(L,R){
+  const cp=o=>JSON.parse(JSON.stringify(o));
+  L.sm=L.sm||{cfg:0,logs:{}}; R.sm=R.sm||{cfg:0,logs:{}};
+  if(docEmpty(L)) return cp(R);
+  if(docEmpty(R)) return cp(L);
+  const out={}, lNew=(L.sm.cfg||0)>=(R.sm.cfg||0), base=lNew?L:R, sm={cfg:Math.max(L.sm.cfg||0,R.sm.cfg||0),logs:{}};
+  out.blocks=unionById(cp(L.blocks),cp(R.blocks));
+  out.programmes=unionById(cp(L.programmes),cp(R.programmes),(x,y)=>(x.saved>=y.saved?x:y));
+  out.library=cp(base.library); out.name=base.name||L.name||R.name||"";
+  if(L.block.id===R.block.id){
+    out.block=cp(base.block); out.plan=cp(base.plan); out.logs={};
+    for(const k of new Set([...Object.keys(L.logs||{}),...Object.keys(R.logs||{})])){
+      const a=(L.logs||{})[k], b=(R.logs||{})[k], ta=(L.sm.logs||{})[k]||0, tb=(R.sm.logs||{})[k]||0;
+      out.logs[k]=cp((!b||(a&&ta>=tb))?a:b); sm.logs[k]=Math.max(ta,tb);
+    }
+  }else{
+    const lWins=(L.block.start>R.block.start)||(L.block.start===R.block.start&&lNew), win=lWins?L:R, lose=lWins?R:L;
+    out.block=cp(win.block); out.plan=cp(win.plan); out.logs=cp(win.logs||{});
+    for(const k in out.logs) sm.logs[k]=(win.sm.logs||{})[k]||0;
+    const ls=blockStats(lose.plan,lose.logs||{}), arch=out.blocks.find(b=>b.id===lose.block.id);
+    if(arch){   // already archived by the other device: fold in any sessions only this side has
+      let added=false; for(const k in (lose.logs||{})) if(!(k in arch.logs)){ arch.logs[k]=cp(lose.logs[k]); added=true; }
+      if(added) arch.summary=blockStats(arch.plan,arch.logs);
+    }else if(ls.sets) out.blocks.push({id:lose.block.id,name:lose.block.name||"Untitled block",progId:lose.block.progId||"",start:lose.block.start,end:todayISO(),plan:cp(lose.plan),logs:cp(lose.logs||{}),summary:ls});
+  }
+  out.sm=sm; return out;
+}
+/* ---- talking to Supabase ---- */
+function setSession(j){ sync.session={access:j.access_token,refresh:j.refresh_token,exp:Date.now()+(j.expires_in||3600)*1000,uid:(j.user&&j.user.id)||(sync.session&&sync.session.uid),email:(j.user&&j.user.email)||(sync.session&&sync.session.email)}; persistSync(); }
+async function refreshSession(){
+  const r=await fetch(sync.url+"/auth/v1/token?grant_type=refresh_token",{method:"POST",headers:{apikey:sync.key,"Content-Type":"application/json"},body:JSON.stringify({refresh_token:sync.session.refresh})});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok||!j.access_token){ const e=new Error("signed-out"); e.auth=true; throw e; }
+  setSession(j);
+}
+async function api(path,opts,retried){
+  if(!sync.session){ const e=new Error("signed-out"); e.auth=true; throw e; }
+  if(sync.session.exp-Date.now()<60000) await refreshSession();
+  const r=await fetch(sync.url+path,Object.assign({},opts,{headers:Object.assign({apikey:sync.key,Authorization:"Bearer "+sync.session.access,"Content-Type":"application/json"},(opts&&opts.headers)||{})}));
+  if(r.status===401&&!retried){ await refreshSession(); return api(path,opts,true); }
+  return r;
+}
+async function must(r){ if(r.ok) return r; const j=await r.json().catch(()=>({})); const e=new Error(j.message||j.msg||("HTTP "+r.status)); e.status=r.status; e.code=j.code; throw e; }
+async function getRows(q){ const r=await must(await api(SYNC_T+"?"+q)); return r.json(); }
+async function patchRow(me,rev,doc){ const r=await must(await api(SYNC_T+"?user_id=eq."+me+"&rev=eq."+rev,{method:"PATCH",headers:{Prefer:"return=representation"},body:JSON.stringify({data:doc,rev:rev+1,device:sync.deviceId})})); return r.json(); }
+function scheduleSync(ms){ if(!sync.session) return; clearTimeout(sync.t); sync.t=setTimeout(()=>syncNow(),ms||4000); }
+function setSync(st,msg){ sync.status=st; sync.msg=msg||""; paintSync(); }
+function statusLine(){
+  const t=sync.lastSync?new Date(sync.lastSync).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"";
+  return {syncing:"Syncing…",ok:"Up to date · last sync "+t,offline:"Offline — will retry when you're back online",err:"Problem: "+sync.msg,signedout:"Signed out — sign in again",idle:"Ready"}[sync.status]||"";
+}
+function paintSync(){
+  const dot=$("#syncdot"), stat=$("#syncstat");
+  const short={syncing:"☁ syncing…",ok:"☁ synced",offline:"☁ offline",err:"☁ sync problem",signedout:"☁ signed out",idle:"☁"}[sync.status]||"";
+  if(dot) dot.textContent=sync.session||sync.status==="signedout"?" · "+short:"";
+  if(stat) stat.textContent=statusLine();
+}
+function handleSyncError(e){
+  if(e&&e.auth){ sync.session=null; persistSync(); setSync("signedout"); toast("Signed out of cloud sync — sign in again"); if(state.tab==="data") render(); return; }
+  if(e instanceof TypeError||/Failed to fetch|NetworkError|Load failed/i.test(e.message||"")){ setSync("offline"); scheduleSync(30000); return; }
+  if(e.status===404||e.code==="PGRST205"||e.code==="42P01"){ setSync("err","the cloud table is missing — run the setup SQL (see SYNC-SETUP.md)"); return; }
+  setSync("err",e.message||"unknown error");
+}
+async function syncNow(){
+  if(!sync.session) return;
+  if(sync.busy){ sync.again=true; return; }
+  if(entry){ scheduleSync(8000); return; }       // never swap data underneath an open keypad
+  sync.busy=true; sync.lastTry=Date.now(); setSync("syncing");
+  try{
+    let done=false;
+    for(let attempt=0;attempt<4&&!done;attempt++){
+      flushSave(true);
+      const me=sync.session.uid, doc=exportDoc(), ch=contentHash(doc);
+      const head=await getRows("select=rev&user_id=eq."+me), rrev=head.length?head[0].rev:0;
+      if(rrev===0){
+        const r=await api(SYNC_T,{method:"POST",headers:{Prefer:"return=minimal"},body:JSON.stringify({user_id:me,data:doc,rev:1,device:sync.deviceId})});
+        if(r.status===409) continue;
+        await must(r); sync.baseRev=1; sync.pushedHash=ch; done=true; break;
+      }
+      if(rrev===sync.baseRev){
+        if(ch===sync.pushedHash){ done=true; break; }
+        const rows=await patchRow(me,rrev,doc);
+        if(rows.length){ sync.baseRev=rrev+1; sync.pushedHash=ch; done=true; }
+        continue;
+      }
+      const remote=(await getRows("select=rev,data&user_id=eq."+me))[0]; if(!remote) continue;
+      const merged=mergeDocs(doc,remote.data);
+      if(contentHash(exportDoc())!==ch) continue;      // edited while we were talking to the server: go round again
+      applyDoc(merged);
+      const doc2=exportDoc(), c2=contentHash(doc2);
+      if(contentHash(remote.data)===c2){ sync.baseRev=remote.rev; sync.pushedHash=c2; done=true; break; }
+      const rows=await patchRow(me,remote.rev,doc2);
+      if(rows.length){ sync.baseRev=remote.rev+1; sync.pushedHash=c2; done=true; }
+    }
+    if(!done) throw new Error("the cloud copy kept changing — will retry");
+    sync.lastSync=Date.now(); setSync("ok");
+  }catch(e){ handleSyncError(e); }
+  finally{ sync.busy=false; persistSync(); if(sync.again){ sync.again=false; scheduleSync(1500); } }
+}
+async function authenticate(kind){
+  const q=id=>document.getElementById(id);
+  const url=q("sy-url").value.trim().replace(/\/+$/,""), key=q("sy-key").value.trim(), email=q("sy-email").value.trim(), pass=q("sy-pass").value;
+  if(!/^https?:\/\/[^\s]+$/.test(url)||!key||!email||!pass){ toast("Fill in the project address, key, email and password"); return; }
+  sync.url=url; sync.key=key;
+  try{
+    const r=await fetch(url+(kind==="up"?"/auth/v1/signup":"/auth/v1/token?grant_type=password"),{method:"POST",headers:{apikey:key,"Content-Type":"application/json"},body:JSON.stringify({email,password:pass})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok){ toast(j.error_description||j.msg||j.message||"Couldn't sign in"); return; }
+    if(!j.access_token){ persistSync(); toast("Account created — confirm the email sent to you, then press Sign in"); return; }
+    sync.baseRev=0; sync.pushedHash=""; setSession(j); setSync("syncing"); toast("Signed in"); render(); await syncNow();
+  }catch(e){ toast("Can't reach that project — check the address and your connection"); }
+}
+function syncCardHTML(){
+  if(sync.session) return `<div class="sect disp">Cloud sync</div><div class="card">
+    <div style="font-size:14px">Signed in as <b>${esc(sync.session.email||"")}</b></div>
+    <div class="hint" id="syncstat">${esc(statusLine())}</div>
+    <div class="formline" style="margin-top:10px"><button class="btn primary" id="syncnow">Sync now</button><button class="btn" id="synccopy">Copy setup code</button><button class="btn danger" id="syncout">Sign out</button></div>
+    <p class="hint">Changes upload a few seconds after you make them and download when you open the app. If two devices were edited at once they are merged, and the cloud keeps recent snapshots as a safety net. On another device, paste the setup code (it holds the project address and key, not your password).</p>
+  </div>`;
+  return `<div class="sect disp">Cloud sync</div><div class="card">
+    <p style="font-size:14px">Keeps your devices in step automatically. One-time setup takes about five minutes — <a href="https://github.com/crb2zc5zkn-glitch/iron-records-log/blob/main/SYNC-SETUP.md" target="_blank" rel="noopener">follow the steps here</a>.</p>
+    <label class="fld" style="margin-top:10px"><span class="fl">Setup code (from another device)</span><input id="sy-code" placeholder="bp5:…" autocomplete="off" autocapitalize="off"></label>
+    <div class="fields" style="margin-top:10px">
+      <label class="fld wide"><span class="fl">Project address</span><input id="sy-url" value="${esc(sync.url)}" placeholder="https://xxxx.supabase.co" autocomplete="off" autocapitalize="off" inputmode="url"></label>
+      <label class="fld wide"><span class="fl">Public (anon) key</span><input id="sy-key" value="${esc(sync.key)}" placeholder="eyJ… or sb_publishable_…" autocomplete="off" autocapitalize="off"></label>
+      <label class="fld"><span class="fl">Email</span><input id="sy-email" type="email" autocomplete="username" autocapitalize="off"></label>
+      <label class="fld"><span class="fl">Password</span><input id="sy-pass" type="password" autocomplete="current-password"></label>
+    </div>
+    <div class="formline" style="margin-top:12px"><button class="btn primary" id="sy-in">Sign in</button><button class="btn" id="sy-up">Create account</button></div>
+    ${sync.status==="signedout"?'<p class="hint">You were signed out — sign in again to resume syncing.</p>':""}
+  </div>`;
+}
+function wireSync(v){
+  const on=(id,fn)=>{ const el=v.querySelector("#"+id); if(el) el.addEventListener("click",fn); };
+  on("sy-in",()=>authenticate("in")); on("sy-up",()=>authenticate("up"));
+  const code=v.querySelector("#sy-code");
+  if(code) code.addEventListener("input",()=>{ const t=code.value.trim(); if(!t.startsWith("bp5:")) return; try{ const o=JSON.parse(atob(t.slice(4))); v.querySelector("#sy-url").value=o.u; v.querySelector("#sy-key").value=o.k; toast("Setup code applied — now enter your email and password"); }catch(e){ toast("That setup code isn't valid"); } });
+  on("syncnow",()=>{ sync.again=false; syncNow(); });
+  on("syncout",()=>confirmDlg("Sign out of cloud sync on this device? Your data stays here and in the cloud.","Sign out",()=>{ sync.session=null; sync.baseRev=0; sync.pushedHash=""; persistSync(); setSync("off"); render(); }));
+  on("synccopy",async()=>{ const c="bp5:"+btoa(JSON.stringify({u:sync.url,k:sync.key})); try{ await navigator.clipboard.writeText(c); toast("Setup code copied — paste it on your other device"); }catch(e){ prompt("Copy this setup code:",c); } });
+}
+function initSync(){
+  paintSync();
+  if(sync.session) setTimeout(()=>syncNow(),600);
+  document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible"&&sync.session&&Date.now()-sync.lastTry>5000) syncNow(); });
+  addEventListener("online",()=>{ if(sync.session) syncNow(); });
 }
 
 /* ================= TRAIN ================= */
@@ -1198,7 +1388,8 @@ function dataHTML(){
     <div class="disp" style="font-size:15px">Settings</div>
     <div class="formline"><label>Your name</label><input id="setname" value="${esc(state.name)}" placeholder="Lee" style="flex:1;min-width:120px"></div>
   </div>
-  <div class="sect disp">Device sync</div>
+  ${syncCardHTML()}
+  <div class="sect disp">Backup &amp; manual transfer</div>
   <div class="card">
     <p style="font-size:14px">Your log saves automatically <b>on this device</b>. To move it to another device (Mac ↔ iPhone), export here and import there — takes about 10 seconds.</p>
     <div class="formline" style="margin-top:10px">
@@ -1259,6 +1450,7 @@ function initDock(){
 
 /* ================= wiring ================= */
 function wireExtra(v){
+  wireSync(v);
   v.querySelectorAll("[data-style]").forEach(sel=>sel.addEventListener("change",()=>{ const [s,mth,slot]=sel.dataset.style.split("|"); state.plan[s][mth][slot].style=sel.value; save(); }));
   v.querySelectorAll("[data-model]").forEach(sel=>sel.addEventListener("change",()=>{ const [s,mth,slot]=sel.dataset.model.split("|"); state.plan[s][mth][slot].model=sel.value; save(); }));
   v.querySelectorAll("[data-vsel]").forEach(seg=>seg.addEventListener("click",e=>{ const b=e.target.closest("button[data-v]"); if(!b) return; state.volSel[seg.dataset.vsel]=+b.dataset.v; save(); render(); }));
@@ -1393,6 +1585,7 @@ try{
 }catch(e){}
 initDock();
 render();
+initSync();
 if("serviceWorker" in navigator) addEventListener("load",()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));
 if(navigator.storage&&navigator.storage.persist) navigator.storage.persist().catch(()=>{});
 </script>
