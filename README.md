@@ -1,4 +1,4 @@
-# Big Picture 5-Day
+# Iron Records — training log
 
 Personal 12-week training log (installable web app): plan sessions, log sets with RPE, track progress and weekly sets per muscle.
 
